@@ -160,6 +160,50 @@ class AppCodeRefreshTests(unittest.TestCase):
         app.save_now.assert_called_once_with()
         app.quit.assert_called_once_with()
 
+    def test_save_failure_does_not_reach_callers_and_recovers_after_success(self):
+        app = SimpleNamespace(
+            win=Mock(),
+            _icon_choice="default",
+            _custom_icon_path="",
+            _start_on_boot=False,
+            _save_error_reported=False,
+            _report_save_error=Mock(),
+        )
+        app.win.current_config.return_value = {"watchlist": {}}
+
+        with patch("stockwidget.app.save_file", side_effect=PermissionError(13, "denied")):
+            App.save_now(app)
+
+        app._report_save_error.assert_called_once()
+        self.assertIsInstance(app._report_save_error.call_args.args[0], PermissionError)
+
+        with patch("stockwidget.app.save_file") as save:
+            App.save_now(app)
+        save.assert_called_once()
+        app._report_save_error.assert_called_once()
+
+    def test_save_error_is_reported_only_once(self):
+        app = SimpleNamespace(_save_error_reported=False)
+        app._report_save_error = App._report_save_error.__get__(app)
+
+        with patch("stockwidget.app.QMessageBox") as message_box:
+            app._report_save_error(PermissionError(13, "denied"))
+            app._report_save_error(PermissionError(13, "denied"))
+
+        message_box.critical.assert_called_once()
+
+    def test_quit_still_shuts_down_when_saving_fails(self):
+        app = SimpleNamespace(
+            tray=Mock(),
+            save_now=Mock(side_effect=PermissionError(13, "denied")),
+            quit=Mock(),
+            _report_save_error=Mock(),
+        )
+        App.quit_app(app)
+        app.tray.hide.assert_called_once_with()
+        app._report_save_error.assert_called_once()
+        app.quit.assert_called_once_with()
+
     def test_schedule_refresh_converts_seconds_and_clamps_non_positive_delay(self):
         app = SimpleNamespace(_codes_retry_timer=Mock())
         for seconds, milliseconds in ((1800, 1800 * 1000), (0, 1000)):

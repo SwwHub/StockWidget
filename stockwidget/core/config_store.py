@@ -2,6 +2,7 @@
 """固定程序数据路径、旧版本启动迁移与原子配置保存（纯 Python，无 Qt 依赖）。"""
 
 from contextlib import closing
+from functools import lru_cache
 import json
 import os
 from pathlib import Path
@@ -14,12 +15,37 @@ import time
 from stockwidget.constants import APP_NAME, CONFIG_FILE, CODE_LIST_FILES, CODES_STATUS_FILE
 
 
-def config_paths() -> str:
-    """全部程序数据使用平台固定目录，不读取用户目录偏好。"""
+def _platform_config_paths() -> str:
+    """系统固定数据目录；便携目录不可用时使用。"""
     if sys.platform == "darwin":
         return os.path.join(os.path.expanduser("~"), "Library", "Application Support", APP_NAME)
     base = os.getenv("APPDATA") if sys.platform == "win32" else None
     return os.path.join(base or os.path.expanduser("~"), APP_NAME)
+
+
+def _directory_is_writable(directory: str) -> bool:
+    probe = os.path.join(directory, ".stockwidget-write-test")
+    try:
+        with open(probe, "w", encoding="utf-8") as file:
+            file.write("")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+@lru_cache(maxsize=1)
+def portable_directory() -> str | None:
+    """打包运行时程序所在目录可写即视为便携版；源码运行与 macOS 始终返回 None。"""
+    if sys.platform == "darwin" or not getattr(sys, "frozen", False):
+        return None
+    base = os.path.dirname(os.path.abspath(sys.executable))
+    return base if _directory_is_writable(base) else None
+
+
+def config_paths() -> str:
+    """便携版把配置与缓存放在程序目录，其余情况使用平台固定目录。"""
+    return portable_directory() or _platform_config_paths()
 
 
 def data_cache_dir() -> str:
@@ -53,7 +79,10 @@ def save_file(data: dict, file_name: str, *, directory: str | None = None) -> No
         os.replace(temporary, os.path.join(directory, file_name))
     finally:
         if temporary and os.path.exists(temporary):
-            os.remove(temporary)
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
 
 
 def _read_configuration(directory):
@@ -175,10 +204,33 @@ def _install_migration(stage, root, backups):
         raise
 
 
+def _adopt_portable_data() -> None:
+    """首次便携运行时，把平台目录里的配置与市场代码表复制到程序目录。"""
+    portable = portable_directory()
+    if not portable:
+        return
+    platform_dir = _platform_config_paths()
+    if os.path.abspath(portable) == os.path.abspath(platform_dir):
+        return
+    if os.path.exists(os.path.join(portable, CONFIG_FILE)):
+        return
+    try:
+        config = os.path.join(platform_dir, CONFIG_FILE)
+        if os.path.isfile(config):
+            shutil.copy2(config, os.path.join(portable, CONFIG_FILE))
+        source = os.path.join(platform_dir, "data")
+        if os.path.isdir(source):
+            shutil.copytree(source, os.path.join(portable, "data"), dirs_exist_ok=True)
+    except OSError:
+        # 迁移只是便利，失败时按空配置启动，不阻塞程序运行。
+        pass
+
+
 def initialize_data_directory() -> dict:
-    """仅迁移 macOS 的 ~/StockWidget；完整保存后删除旧目录。"""
+    """便携版接管平台目录中的配置；仅 darwin 迁移 ~/StockWidget 后删除旧目录。"""
+    _adopt_portable_data()
     root = Path(config_paths())
-    if sys.platform != "darwin":
+    if sys.platform != "darwin" or portable_directory():
         return load_file(CONFIG_FILE)
     legacy = Path(os.path.expanduser("~")) / APP_NAME
     if legacy == root or not os.path.lexists(legacy):

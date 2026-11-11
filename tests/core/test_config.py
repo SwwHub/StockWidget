@@ -1,12 +1,16 @@
 """配置保存与分页 / 同步参数迁移。"""
 
 import os
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from stockwidget.constants import APP_NAME
-from stockwidget.core.config_store import config_paths, history_cache_dir, load_file, save_file
+from stockwidget.constants import APP_NAME, CONFIG_FILE
+from stockwidget.core.config_store import (
+    config_paths, history_cache_dir, initialize_data_directory, load_file,
+    portable_directory, save_file,
+)
 from stockwidget.core.view_options import ViewOptions, column_ranges, page_slice, taskbar_font_pixels
 
 
@@ -16,8 +20,55 @@ class ConfigStoreTests(unittest.TestCase):
         self.enterContext(patch("stockwidget.core.config_store.sys.platform", "linux"))
         self.enterContext(patch("stockwidget.core.config_store.os.path.expanduser", return_value=self._tmp))
 
+    def _packaged_in(self, directory):
+        self.enterContext(patch.object(sys, "frozen", True, create=True))
+        self.enterContext(patch.object(sys, "executable", os.path.join(directory, "StockWidget.exe")))
+        portable_directory.cache_clear()
+        self.addCleanup(portable_directory.cache_clear)
+
     def test_config_paths(self):
         self.assertEqual(config_paths(), os.path.join(self._tmp, APP_NAME))
+
+    def test_source_run_never_uses_the_executable_folder(self):
+        portable_directory.cache_clear()
+        self.assertIsNone(portable_directory())
+        self.assertEqual(config_paths(), os.path.join(self._tmp, APP_NAME))
+
+    def test_packaged_writable_executable_folder_becomes_portable(self):
+        portable_dir = self.enterContext(tempfile.TemporaryDirectory())
+        self._packaged_in(portable_dir)
+        self.assertEqual(portable_directory(), portable_dir)
+        self.assertEqual(config_paths(), portable_dir)
+        self.assertEqual(history_cache_dir(), os.path.join(portable_dir, "cache"))
+
+    def test_packaged_read_only_executable_folder_falls_back_to_the_platform_directory(self):
+        portable_dir = self.enterContext(tempfile.TemporaryDirectory())
+        self._packaged_in(portable_dir)
+        with patch("stockwidget.core.config_store._directory_is_writable", return_value=False):
+            self.assertIsNone(portable_directory())
+            self.assertEqual(config_paths(), os.path.join(self._tmp, APP_NAME))
+
+    def test_first_portable_run_adopts_configuration_and_code_lists(self):
+        portable_dir = self.enterContext(tempfile.TemporaryDirectory())
+        self._packaged_in(portable_dir)
+        platform_dir = os.path.join(self._tmp, APP_NAME)
+        os.makedirs(os.path.join(platform_dir, "data"))
+        save_file({"watchlist": [{"code": "sh600000"}]}, CONFIG_FILE, directory=platform_dir)
+        with open(os.path.join(platform_dir, "data", "stock_sh.json"), "w", encoding="utf-8") as file:
+            file.write('{"last_update": "2026-01-01", "codes": {}}')
+
+        config = initialize_data_directory()
+
+        self.assertEqual(config.get("watchlist"), [{"code": "sh600000"}])
+        self.assertTrue(os.path.isfile(os.path.join(portable_dir, CONFIG_FILE)))
+        self.assertTrue(os.path.isfile(os.path.join(portable_dir, "data", "stock_sh.json")))
+
+    def test_portable_run_keeps_its_own_configuration_once_created(self):
+        portable_dir = self.enterContext(tempfile.TemporaryDirectory())
+        self._packaged_in(portable_dir)
+        save_file({"custom_icon_path": "local.ico"}, CONFIG_FILE)
+
+        self.assertEqual(initialize_data_directory(), {"custom_icon_path": "local.ico"})
 
     def test_history_directory_is_within_the_fixed_program_directory(self):
         self.assertEqual(history_cache_dir(), os.path.join(config_paths(), "cache"))

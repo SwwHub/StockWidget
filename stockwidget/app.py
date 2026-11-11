@@ -15,7 +15,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 import resources.resources_rc  # noqa: F401  加载 Qt 内嵌资源（图标、内置代码列表）
 
 from stockwidget.constants import APP_NAME, APP_VERSION, CONFIG_FILE
-from stockwidget.core.config_store import initialize_data_directory, save_file
+from stockwidget.core.config_store import config_paths, initialize_data_directory, save_file
 from stockwidget.core.window_rules import best_screen
 from stockwidget.data.code_lists import CODES_RETRY_SECONDS, CodeListManager
 from stockwidget.data.update_check import get_update_info
@@ -92,6 +92,7 @@ class App(QApplication):
 
         # 启动浮窗
         self.settings_dlg = None
+        self._save_error_reported = False
         self.taskbar = TaskbarController(self.win, self.open_settings, self)
         self.aboutToQuit.connect(self.taskbar.close)
         self.taskbar.apply_mode()
@@ -260,8 +261,13 @@ class App(QApplication):
 
     def quit_app(self):
         self.tray.hide()
-        self.save_now()
-        self.quit()
+        try:
+            self.save_now()
+        except OSError as exc:
+            # 保存失败也必须结束进程，否则托盘已隐藏而浮窗残留。
+            self._report_save_error(exc)
+        finally:
+            self.quit()
 
     def save_now(self):
         cfg = self.win.current_config()
@@ -269,7 +275,24 @@ class App(QApplication):
         if self._custom_icon_path:
             cfg['custom_icon_path'] = self._custom_icon_path
         cfg['start_on_boot'] = self._start_on_boot
-        save_file(cfg, CONFIG_FILE)
+        try:
+            save_file(cfg, CONFIG_FILE)
+        except OSError as exc:
+            # 设置页、代码表刷新和退出流程都会触发保存；单次失败不能中断调用方。
+            self._report_save_error(exc)
+        else:
+            self._save_error_reported = False
+
+    def _report_save_error(self, exc):
+        """只在首次失败时提示，避免配置连续变化时反复弹窗。"""
+        if getattr(self, "_save_error_reported", False):
+            return
+        self._save_error_reported = True
+        QMessageBox.critical(
+            None,
+            "保存设置失败",
+            f"无法保存配置：\n{exc}\n\n请确认 {config_paths()} 可写。",
+        )
 
     def set_app_icon(self, choice):
         """Set application and tray icon."""
